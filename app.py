@@ -5,25 +5,28 @@ from flask_bcrypt import Bcrypt
 from flask_cors import CORS
 from datetime import timedelta
 from datetime import datetime
-from flask_sqlalchemy import SQLAlchemy
-from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
-from emotion_detector import analyze_emotion_frame
+from emotion_detector import analyze_emotion_frame, process_frame_for_motion
 from generate_image import generate_image_from_text
 import io
 from PIL import Image as PILImage
 import base64
+import cv2
+import numpy as np
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_secret_key_here'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-CORS(app)  # Enable CORS for all domains
+CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 login_manager = LoginManager(app)
+
+
+emotion_analysis_results = []
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -40,7 +43,7 @@ class Image(db.Model):
     creation_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
     def __repr__(self):
-        return f'<Image {self.id}, {self.user_id}, {self.image_path}, {self.creation_date}>'
+        return f'<Image {self.id}, {self.user_id}, {self.image_path}, {self.creation_date}>'    
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -91,13 +94,6 @@ def delete_account():
         return jsonify({'message': 'User deleted successfully'}), 200
     return jsonify({'message': 'User not found'}), 404
 
-@app.route('/api/image/video-emotion', methods=['POST'])
-@login_required
-def video_emotion():
-    # Placeholder for video stream processing and emotion detection
-    emotions, colors = analyze_emotion_frame(request.data)
-    return jsonify({'emotions': emotions, 'colors': colors}), 200
-
 @app.route('/api/image/generate-image', methods=['POST'])
 @login_required
 def generate_image():
@@ -112,26 +108,87 @@ def generate_image():
 
 @socketio.on('connect')
 def test_connect():
-    emit('my response', {'data': 'Connected'})
+    emit('server_connect_response', {'status': 'Connected'})
 
 def convert_image(data):
-    """
-    Convert the received image data from binary to a PIL Image.
-    This function assumes the binary data is a JPEG image.
-    """
-    image_stream = io.BytesIO(data)
+    image_data = base64.b64decode(data)
+    image_stream = io.BytesIO(image_data)
     image_stream.seek(0)
     image = PILImage.open(image_stream)
-    return image
+    open_cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    gray_image = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
+    return gray_image
+
+
+reference_frame = None
+
+def get_reference_frame():
+    global reference_frame
+    return reference_frame
+
+def update_reference_frame(new_frame):
+    global reference_frame
+    reference_frame = new_frame
 
 @socketio.on('stream_frame')
 def handle_video_frame(data):
-    # Process the frame for emotion detection
-    # `data` should contain the necessary information to process the frame
-    image = convert_image(data)
-    emotions = analyze_emotion_frame(image)
-    # Emit detected emotions back to the client
-    emit('emotion_data', {'emotions': {"emotion": emotions, "colors": "red"}})
+    global reference_frame
+    frame = convert_image(data)  # Frame is now a grayscale image
+
+    # If we don't have a reference frame yet, set the current frame as reference
+    if reference_frame is None:
+        update_reference_frame(frame)
+        emit('frame_status', {'status': 'reference_frame_set'})
+        return
+
+    # Now use the motion detection function
+    if process_frame_for_motion(frame, reference_frame):
+        # If significant motion is detected, update the reference frame and proceed
+        update_reference_frame(frame)
+        # Placeholder for emotion detection logic
+        # emotions = analyze_emotion_frame(frame)
+        emotion = analyze_emotion_frame(frame)
+        # Append detected emotions to the results list
+        emotion_analysis_results.append(emotion)
+    else:
+        emit('frame_status', {'status': 'no_significant_motion'})
+
+@socketio.on('stop_stream')
+def handle_stop_stream():
+    global emotion_analysis_results
+    sanitized_results = {}
+    previous_emotion = None
+    for result in emotion_analysis_results:
+        current_emotion = result["emotion"]
+        if current_emotion != previous_emotion:
+            # Map the emotion to a color
+            color = get_emotion_color(current_emotion)
+            # Store the color in the sanitized_results dictionary
+            sanitized_results[current_emotion] = color
+            previous_emotion = current_emotion
+
+    print(sanitized_results)
+
+    # Emit the sanitized emotion analysis results with their corresponding colors
+    emit('emotion_analysis_results', {'results': sanitized_results})
+
+    # Clear the results after sending
+    emotion_analysis_results = []
+
+
+def get_emotion_color(emotion):
+    # Define a mapping of emotions to colors
+    emotion_color_mapping = {
+        'happy': 'yellow',
+        'sad': 'blue',
+        'angry': 'red',
+        'disgusted': 'green',
+        'fearful': 'purple',
+        'neutral': 'gray',
+        'surprised': 'orange',
+    }
+    # Return the color associated with the emotion, or 'black' if the emotion is unknown
+    return emotion_color_mapping.get(emotion, 'black')
 
 if __name__ == '__main__':
     with app.app_context():
