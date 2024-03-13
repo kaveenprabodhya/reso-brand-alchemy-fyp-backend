@@ -4,9 +4,25 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import image
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 model_path = "C:\\Users\\kaveenprabodhya\\Desktop\\my-FYP-Research\\project\\models\\model.h5"
 model = load_model(model_path)
+
+executor = ThreadPoolExecutor(max_workers=5)
+
+def analyze_emotion_frame_async(frame, user_id, callback):
+    """
+    Analyzes the emotion of a given frame in an asynchronous manner.
+    
+    Parameters:
+    - frame: The image frame to analyze.
+    - callback: The function to call with the analysis result.
+    """
+    future = executor.submit(analyze_emotion_frame, frame)
+    future.add_done_callback(
+        lambda x: callback(x.result(), user_id)
+    )
 
 def analyze_emotion_frame(frame):
     # Assuming `frame` is an OpenCV image captured from a video stream
@@ -37,13 +53,13 @@ def analyze_emotion_frame(frame):
 
     return predicted_emotion
 
-def process_frame_for_motion(frame, reference_frame, threshold=25):
+def process_frame_for_motion(gray_frame, reference_frame, threshold=25):
     # Convert frames to grayscale
-    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray_reference = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
+    # gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # gray_reference = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
 
     # Compute the absolute difference between the current and reference frames
-    diff = cv2.absdiff(gray_frame, gray_reference)
+    diff = cv2.absdiff(gray_frame, reference_frame)
 
     # Apply a threshold to the difference
     _, thresh = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
