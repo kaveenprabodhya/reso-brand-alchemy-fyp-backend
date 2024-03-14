@@ -10,6 +10,8 @@ from generate_image import generate_image_from_text
 from PIL import Image as PILImage
 from threading import Lock
 from flask import session
+from flask_jwt_extended import JWTManager, create_access_token, verify_jwt_in_request, get_jwt_identity
+from datetime import timedelta
 import io
 import base64
 import cv2
@@ -17,9 +19,12 @@ import numpy as np
 import re
 
 app = Flask(__name__)
+app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'
 app.config['SECRET_KEY'] = 'your_secret_key_here'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///resobrandalchemy.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SESSION_COOKIE_SAMESITE'] = 'None'
+app.config['SESSION_COOKIE_SECURE'] = True
 CORS(app, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins="*", manage_session=False)
 
@@ -27,7 +32,7 @@ db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 login_manager = LoginManager(app)
 
-user_sids = {}
+# user_sids = {}
 
 emotion_analysis_results = []
 
@@ -78,7 +83,7 @@ def register():
     if not validate_password(data['password']):
         return jsonify({'message': 'Password must be at least 8 characters long and include both letters and numbers'}), 400
 
-    # Check for existing user5
+    # Check for existing user
     user = User.query.filter_by(email=data['email']).first()
     if user:
         return jsonify({'message': 'User already exists'}), 409
@@ -91,9 +96,14 @@ def register():
 
     # Log the user in automatically after registration
     login_user(new_user, remember=True)
-    session['user_id'] = new_user.id  # Again, explicitly setting user ID in the session, if required
 
-    return jsonify({'message': 'User created and logged in successfully', 'user_id': new_user.id}), 201
+    # additional_claims = {'email': new_user.email, 'first_name': new_user.first_name, 'last_name': new_user.last_name}
+    # Create JWT token for the new user
+    # access_token = create_access_token(identity=str(new_user.id), expires_delta=timedelta(hours=1), additional_claims=additional_claims)
+    
+    session['user_id'] = new_user.id  # Explicitly setting user ID in the session, if required
+
+    return jsonify({'message': 'User created, logged in successfully, and token generated'}), 201
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
@@ -104,9 +114,12 @@ def login():
     user = User.query.filter_by(email=data['email']).first()
     if user and bcrypt.check_password_hash(user.password, data['password']):
         login_user(user, remember=True)
+        # Create JWT token
+        # payload = {'email': user.email, 'first_name': user.first_name, 'last_name': user.last_name}
+        # access_token = create_access_token(identity=str(user.id), expires_delta=timedelta(hours=1), additional_claims=payload)
         # Flask-Login handles session management, but you can add more session data as needed
         session['user_id'] = user.id  # Explicitly setting user ID in the session, if required
-        return jsonify({'message': 'Logged in successfully', 'user_id': user.id}), 200
+        return jsonify({'message': 'Logged in successfully'}), 200
     return jsonify({'message': 'Invalid email or password'}), 401
 
 @app.route('/api/auth/current-user', methods=['GET'])
@@ -151,13 +164,64 @@ def generate_image():
     db.session.commit()
     return jsonify({'image_path': image_path, 'creation_date': new_image.creation_date.isoformat()}), 201
 
+reference_frame = None
+analysis_in_progress = 0
+analysis_lock = Lock()
+streaming_stopped = False
+
+def get_reference_frame():
+    global reference_frame
+    return reference_frame
+
+def update_reference_frame(new_frame):
+    global reference_frame
+    reference_frame = new_frame
+
+def verify_token(auth_token):
+    try:
+        # Manually set the JWT
+        with app.test_request_context(headers={"Authorization": f"Bearer {auth_token}"}):
+            # Use Flask-JWT-Extended's built-in method to verify the JWT exists and is valid
+            verify_jwt_in_request()
+            return True
+    except Exception as e:
+        print(f"Token verification error: {e}")
+        return False
+
+def decode_auth_token(auth_token):
+    try:
+        # Manually set the JWT for the context
+        with app.test_request_context(headers={"Authorization": f"Bearer {auth_token}"}):
+            # Get the identity of the JWT, which should be your user ID if you set it as such
+            user_id = get_jwt_identity()
+            return user_id
+    except Exception as e:
+        print(f"Token decoding error: {e}")
+        return None
+
+def get_user_id_from_session():
+    """
+    Retrieves the current user's ID from the session using Flask-Login's current_user.
+    Returns:
+        The user's ID if a user is logged in, None otherwise.
+    """
+    if current_user.is_authenticated:
+        return current_user.get_id() 
+    return None
+
 @socketio.on('connect')
 def socket_server_connect():
-    if current_user.is_authenticated:
-        user_sids[current_user.get_id()] = request.sid
-        emit('server_connect_response', {'status': 'Connected', 'user_id': current_user.get_id()})
-    else:
-        emit('server_connect_response', {'status': 'Unauthorized'})
+    # token = request.args.get('token', '').replace('Bearer ', '')
+
+    # if not verify_token(token):
+    #     emit('error', {'message': 'User not authenticated'})
+    #     return
+    
+    # user_id = decode_auth_token(token)
+
+    # user_sids[user_id] = request.sid
+    
+    emit('server_connect_response', {'status': 'Connected'})
 
 def convert_image(data):
     if isinstance(data, str):
@@ -172,32 +236,18 @@ def convert_image(data):
     open_cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     return cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
 
-reference_frame = None
-analysis_in_progress = 0
-analysis_lock = Lock()
-streaming_stopped = False
-
-def get_reference_frame():
-    global reference_frame
-    return reference_frame
-
-def update_reference_frame(new_frame):
-    global reference_frame
-    reference_frame = new_frame
-
 @socketio.on('stream_frame')
 def handle_video_frame(data):
     global analysis_in_progress, reference_frame
     frame = convert_image(data)  # Frame is now a grayscale image
 
-    user_id = current_user.get_id() if current_user.is_authenticated else None
-    print(user_id)
+    # token = request.args.get('token', '').replace('Bearer ', '')
 
-    if not user_id:
-        # Handle unauthenticated user scenario, perhaps by skipping processing or notifying the client
-        emit('error', {'message': 'User not authenticated'})
-        return
-
+    # if not verify_token(token):
+    #     emit('error', {'message': 'User not authenticated'})
+    #     return
+    
+    # user_id = decode_auth_token(token)
     # If we don't have a reference frame yet, set the current frame as reference
     if reference_frame is None:
         update_reference_frame(frame)
@@ -213,41 +263,27 @@ def handle_video_frame(data):
         with analysis_lock:
             analysis_in_progress += 1
         # Assume analyze_emotion_frame is an asynchronous operation and accepts a callback
-        analyze_emotion_frame_async(frame, user_id=user_id, callback=emotion_analysis_callback)
+        analyze_emotion_frame_async(frame, callback=emotion_analysis_callback)
+        
+        with analysis_lock:
+            if streaming_stopped and analysis_in_progress == 0:
+                send_emotion_analysis_results()
 
-def emotion_analysis_callback(emotion, user_id):
+def emotion_analysis_callback(emotion):
     global analysis_in_progress, streaming_stopped
     with analysis_lock:
-        emotion_analysis_results.append((emotion, user_id))
-        print(emotion)
+        emotion_analysis_results.append(emotion)
         analysis_in_progress -= 1
-        if streaming_stopped and analysis_in_progress == 0:
-            send_emotion_analysis_results(user_id)
-
+        
 def send_emotion_analysis_results():
     global emotion_analysis_results
-    # Process results and emit them to the correct user based on user_id
-    for emotion, user_id in emotion_analysis_results:
-        sanitized_results = process_emotion_results([emotion])  # Assuming process_emotion_results is adapted for single results
-        sid = user_sids.get(str(user_id))
-        if sid:
-            socketio.emit('emotion_analysis_results', {'results': sanitized_results}, room=sid)
-        else:
-            print(f"No active session for user ID {user_id}")
+    # for emotion in emotion_analysis_results:
+    sanitized_results = process_emotion_results(emotion_analysis_results)
+    socketio.emit('emotion_analysis_results', {'results': sanitized_results})
     emotion_analysis_results.clear()
-
-@socketio.on('stop_stream')
-def handle_stop_stream():
-    global streaming_stopped
-    streaming_stopped = True
-    with analysis_lock:
-        if analysis_in_progress == 0:
-            send_emotion_analysis_results()
-
 
 def process_emotion_results(results):
     sanitized_results = {}
-    print(results)
     previous_emotion = None
     for result in results:
         current_emotion = result
@@ -258,7 +294,7 @@ def process_emotion_results(results):
             sanitized_results[current_emotion] = color
             previous_emotion = current_emotion
 
-    print(sanitized_results)
+    return sanitized_results
 
 def get_emotion_color(emotion):
     # Define a mapping of emotions to colors
@@ -274,15 +310,31 @@ def get_emotion_color(emotion):
     # Return the color associated with the emotion, or 'black' if the emotion is unknown
     return emotion_color_mapping.get(emotion, 'black')
 
+@socketio.on('stop_stream')
+def handle_stop_stream():
+    global streaming_stopped
+
+    token = request.args.get('token', '').replace('Bearer ', '')
+
+    if not verify_token(token):
+        emit('error', {'message': 'User not authenticated'})
+        return
+    
+    streaming_stopped = True
+    with analysis_lock:
+        if analysis_in_progress == 0:
+            send_emotion_analysis_results()
+
 @socketio.on('disconnect')
 def handle_disconnect():
-    user_id_to_remove = None
-    for user_id, sid in user_sids.items():
-        if sid == request.sid:
-            user_id_to_remove = user_id
-            break
-    if user_id_to_remove:
-        del user_sids[user_id_to_remove]
+    pass
+    # user_id_to_remove = None
+    # for user_id, sid in user_sids.items():
+    #     if sid == request.sid:
+    #         user_id_to_remove = user_id
+    #         break
+    # if user_id_to_remove:
+    #     del user_sids[user_id_to_remove]
 
 if __name__ == '__main__':
     with app.app_context():

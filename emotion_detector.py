@@ -11,7 +11,7 @@ model = load_model(model_path)
 
 executor = ThreadPoolExecutor(max_workers=5)
 
-def analyze_emotion_frame_async(frame, user_id, callback):
+def analyze_emotion_frame_async(frame, callback):
     """
     Analyzes the emotion of a given frame in an asynchronous manner.
     
@@ -21,7 +21,7 @@ def analyze_emotion_frame_async(frame, user_id, callback):
     """
     future = executor.submit(analyze_emotion_frame, frame)
     future.add_done_callback(
-        lambda x: callback(x.result(), user_id)
+        lambda x: callback(x.result())
     )
 
 def analyze_emotion_frame(frame):
