@@ -4,17 +4,18 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import image
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
-model_path = "C:\\Users\\kaveenprabodhya\\Desktop\\my-FYP-Research\\project\\models\\model.h5"
+model_path = "C:\\Users\\kaveenThivanka\\Desktop\\fyp\\model\\model.h5"
 model = load_model(model_path)
 
 executor = ThreadPoolExecutor(max_workers=5)
 
+
 def analyze_emotion_frame_async(frame, callback):
     """
     Analyzes the emotion of a given frame in an asynchronous manner.
-    
+
     Parameters:
     - frame: The image frame to analyze.
     - callback: The function to call with the analysis result.
@@ -23,6 +24,7 @@ def analyze_emotion_frame_async(frame, callback):
     future.add_done_callback(
         lambda x: callback(x.result())
     )
+
 
 def analyze_emotion_frame(frame):
     # Assuming `frame` is an OpenCV image captured from a video stream
@@ -45,13 +47,15 @@ def analyze_emotion_frame(frame):
     predictions = model.predict(img_preprocessed)
 
     # Map predictions to class labels
-    class_labels = ['angry', 'disgusted', 'fearful', 'happy', 'neutral', 'sad', 'surprised']
+    class_labels = ['angry', 'disgusted', 'fearful',
+                    'happy', 'neutral', 'sad', 'surprised']
     score = tf.nn.softmax(predictions[0])
 
     # Retrieve the label with the highest score
     predicted_emotion = class_labels[np.argmax(score)]
 
     return predicted_emotion
+
 
 def process_frame_for_motion(gray_frame, reference_frame, threshold=25):
     # Convert frames to grayscale
@@ -68,7 +72,8 @@ def process_frame_for_motion(gray_frame, reference_frame, threshold=25):
     dilated = cv2.dilate(thresh, None, iterations=2)
 
     # Find contours to detect significant motion areas
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     # Determine if significant motion is detected based on contours
     motion_detected = len(contours) > 0
