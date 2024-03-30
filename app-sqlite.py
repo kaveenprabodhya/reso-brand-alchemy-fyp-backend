@@ -13,33 +13,49 @@ from flask import session
 from flask_jwt_extended import JWTManager, create_access_token, verify_jwt_in_request, get_jwt_identity, jwt_required
 from datetime import timedelta, datetime
 from collections import defaultdict
-from bson.objectid import ObjectId
-from pymongo import MongoClient
 import io
 import base64
 import cv2
 import numpy as np
 import re
+# import os
 
 app = Flask(__name__)
 app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'
 app.config['SECRET_KEY'] = 'your_secret_key_here'
-app.config['MONGO_URI'] = 'mongodb://localhost:27017/resobrandalchemy'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///resobrandalchemy.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SESSION_COOKIE_SAMESITE'] = 'None'
 app.config['SESSION_COOKIE_SECURE'] = True
 CORS(app, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins="*", manage_session=False)
 jwt = JWTManager(app)
+
+db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 login_manager = LoginManager(app)
 
-# MongoDB setup
-mongo = MongoClient(app.config['MONGO_URI'])
-db = mongo.resobrandalchemy
-users_collection = db.users
-images_collection = db.images
-
 emotion_analysis_results = []
+
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(30), unique=True, nullable=False)
+    password = db.Column(db.String(80), nullable=False)
+    first_name = db.Column(db.String(50), nullable=False)
+    last_name = db.Column(db.String(50), nullable=False)
+    images = db.relationship('Image', backref='user', lazy=True)
+
+
+class Image(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    image = db.Column(db.String(300), nullable=False)
+    creation_date = db.Column(
+        db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<Image {self.id}, {self.user_id}, {self.image}, {self.creation_date}>'
 
 
 def validate_email(email):
@@ -55,137 +71,156 @@ def validate_password(password):
     return True
 
 
-class User(UserMixin):
-    def __init__(self, user_data):
-        self.id = str(user_data['_id'])
-        self.email = user_data['email']
-        self.password = user_data['password']
-        self.first_name = user_data.get('first_name', '')
-        self.last_name = user_data.get('last_name', '')
-
-    @staticmethod
-    def get(user_id):
-        user_data = db.users.find_one({"_id": ObjectId(user_id)})
-        if not user_data:
-            return None
-        return User(user_data)
-
-
 @login_manager.user_loader
 def load_user(user_id):
-    return User.get(user_id)
+    return User.query.get(int(user_id))
 
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
     data = request.json
-    if not all(field in data for field in ['email', 'password', 'firstName', 'lastName']):
+    required_fields = ['email', 'password', 'firstName', 'lastName']
+    if not all(field in data for field in required_fields):
         return jsonify({'message': 'Missing data'}), 400
+
     if not validate_email(data['email']):
         return jsonify({'message': 'Invalid email format'}), 400
     if not validate_password(data['password']):
-        return jsonify({'message': 'Password requirements not met'}), 400
+        return jsonify({'message': 'Password must be at least 8 characters long and include both letters and numbers'}), 400
 
-    if db.users.find_one({'email': data['email']}):
-        return jsonify({'message': 'Email already exists'}), 409
+    user = User.query.filter_by(email=data['email']).first()
+    if user:
+        return jsonify({'message': 'User already exists'}), 409
 
     hashed_password = bcrypt.generate_password_hash(
         data['password']).decode('utf-8')
-    user_id = db.users.insert_one({
-        'email': data['email'],
-        'password': hashed_password,
-        'first_name': data['firstName'],
-        'last_name': data['lastName']
-    }).inserted_id
+    new_user = User(first_name=data['firstName'], last_name=data['lastName'],
+                    email=data['email'], password=hashed_password)
+    db.session.add(new_user)
+    db.session.commit()
 
-    new_user = User.get(user_id)
     login_user(new_user, remember=True)
 
     additional_claims = {'email': new_user.email,
                          'first_name': new_user.first_name, 'last_name': new_user.last_name}
-
     access_token = create_access_token(identity=str(
         new_user.id), expires_delta=timedelta(hours=1), additional_claims=additional_claims)
 
-    return jsonify({'message': 'User registered successfully', 'access_token': access_token}), 201
+    session['user_id'] = new_user.id
+
+    return jsonify({'message': 'User created, logged in successfully, and token generated', 'access_token': access_token}), 201
 
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.json
-    user = db.users.find_one({"email": data.get("email")})
-    if user and bcrypt.check_password_hash(user["password"], data.get("password")):
-        user_obj = User(user)
-        login_user(user_obj, remember=True)
-        payload = {'email': user_obj.email,
-                   'first_name': user_obj.first_name, 'last_name': user_obj.last_name}
+    if not data or 'email' not in data or 'password' not in data:
+        return jsonify({'message': 'Missing data'}), 400
+
+    user = User.query.filter_by(email=data['email']).first()
+    if user and bcrypt.check_password_hash(user.password, data['password']):
+        login_user(user, remember=True)
+        payload = {'email': user.email,
+                   'first_name': user.first_name, 'last_name': user.last_name}
         access_token = create_access_token(identity=str(
-            user_obj.id), expires_delta=timedelta(days=1), additional_claims=payload)
-        return jsonify({"message": "Logged in successfully", "access_token": access_token}), 200
-    return jsonify({"message": "Invalid email or password"}), 401
+            user.id), expires_delta=timedelta(hours=1), additional_claims=payload)
+        session['user_id'] = user.id
+        return jsonify({'message': 'Logged in successfully', 'access_token': access_token}), 200
+    return jsonify({'message': 'Invalid email or password'}), 401
 
 
 @app.route('/api/auth/logout', methods=['POST'])
 @jwt_required()
 def logout():
-    logout_user()
-    return jsonify({"message": "Logged out successfully"}), 200
+    return jsonify({'message': 'Logged out successfully'}), 200
 
 
 @app.route('/api/auth/delete-account', methods=['POST'])
 @jwt_required()
 def delete_account():
-    user_id = get_jwt_identity()
-    db.users.delete_one({"_id": ObjectId(user_id)})
-    logout_user()
-    return jsonify({"message": "Account deleted successfully"}), 200
+    user_id = get_jwt_identity()  # Get the user ID from the JWT
+    user = User.query.get(user_id)
+    if user:
+        db.session.delete(user)
+        db.session.commit()
+
+        logout_user()
+
+        return jsonify({'message': 'User deleted successfully'}), 200
+    else:
+        return jsonify({'message': 'User not found'}), 404
 
 
 @app.route('/api/image/generate-image', methods=['POST'])
 @jwt_required()
 def generate_image():
-    current_user_id = get_jwt_identity()
     data = request.json
-    text = data.get("text")
-    if not text:
-        return jsonify({"error": "Text description is required."}), 400
-
-    images = generate_image_from_text(text)
+    images = generate_image_from_text(data['text'])
 
     created_images_info = []
-    for image_data in images:
-        image_doc = {
-            "user_id": ObjectId(current_user_id),
-            "image_data": image_data,
-            "creation_date": datetime.utcnow()
-        }
-        image_id = db.images.insert_one(image_doc).inserted_id
-        created_images_info.append({"id": str(image_id), "image": image_data})
 
+    for image in images:
+        new_image = Image(user_id=current_user.id, image=image)
+        db.session.add(new_image)
+        db.session.commit()
+
+        # Add the image path and creation date to our list
+        created_images_info.append({'image': image})
+
+    # Return the list of created images
     return jsonify(created_images_info), 201
 
 
-@app.route('/api/image/get-history', methods=['GET'])
+@app.route('/api/image/get-history')
 @jwt_required()
 def get_image_history_for_user():
-    current_user_id = get_jwt_identity()
-    user_images = db.images.find(
-        {"user_id": ObjectId(current_user_id)}).sort("creation_date", -1)
+    user_id = get_jwt_identity()  # Use JWT identity to fetch the current user's ID
+    user_images = Image.query.filter_by(user_id=user_id).order_by(
+        Image.creation_date.desc()).all()
 
-    if user_images.count() == 0:
-        return jsonify({"message": "No images found for the user"}), 404
+    if user_images:
+        images_by_date = defaultdict(list)
+        for img in user_images:
+            date_key = img.creation_date.strftime("%d/%m/%Y")
+            images_by_date[date_key].append(img.image)
 
-    images_by_date = {}
-    for img in user_images:
-        date_key = img["creation_date"].strftime("%d/%m/%Y")
-        if date_key not in images_by_date:
-            images_by_date[date_key] = []
-        images_by_date[date_key].append(img["image_data"])
+        data = []
+        for creation_date, images in images_by_date.items():
+            data.append({
+                'date': creation_date,  # The date when the images were added
+                'imgs': images,  # List of image URLs added on this date
+            })
 
-    data = [{"date": date, "imgs": images}
-            for date, images in images_by_date.items()]
+        # data = [
+        #     {
+        #         'id': 1,
+        #         'brandName': "RBV logo",
+        #         'imgs': [
+        #             "https://mbluxury1.s3.amazonaws.com/2022/02/25172616/chanel-1.jpg",
+        #             "https://cdn.mos.cms.futurecdn.net/JYMtGzLr6f2RGuHkaxJjwD-1200-80.jpg",
+        #             "https://lh3.googleusercontent.com/3bXLbllNTRoiTCBdkybd1YzqVWWDRrRwJNkVRZ3mcf7rlydWfR13qJlCSxJRO8kPe304nw1jQ_B0niDo56gPgoGx6x_ZOjtVOK6UGIr3kshpmTq46pvFObfJ2K0wzoqk36MWWSnh0y9PzgE7PVSRz6Y",
+        #             "https://1000logos.net/wp-content/uploads/2016/10/Batman-Logo-1939.png",
+        #             "https://t3.ftcdn.net/jpg/04/27/44/04/360_F_427440465_7Fgl0hGr3JTjKOVSoUgsRlcL6kUEoTdl.jpg",
+        #         ],
+        #         'created': "12/12/2022",
+        #     },
+        #     {
+        #         'id': 2,
+        #         'brandName': "Can logo",
+        #         'imgs': [
+        #             "https://img.freepik.com/free-vector/bird-colorful-logo-gradient-vector_343694-1365.jpg?size=338&ext=jpg&ga=GA1.1.1803636316.1711814400&semt=sph",
+        #             "https://img.freepik.com/free-vector/gradient-quill-pen-design-template_23-2149837194.jpg",
+        #             "https://marketplace.canva.com/EAFauoQSZtY/1/0/1600w/canva-brown-mascot-lion-free-logo-qJptouniZ0A.jpg",
+        #             "https://cdn.pixabay.com/photo/2017/03/16/21/18/logo-2150297_640.png",
+        #             "https://images.fastcompany.net/image/upload/w_596,c_limit,q_auto:best,f_auto/fc/3034007-inline-i-applelogo.jpg",
+        #         ],
+        #         'created': "23/02/2024",
+        #     },
+        # ]
 
-    return jsonify(data), 200
+        return jsonify(data), 200
+    else:
+        return jsonify({'message': 'No images found for the user'}), 404
 
 
 reference_frame = None
@@ -328,4 +363,6 @@ def handle_disconnect():
 
 
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
     socketio.run(app, debug=True)
