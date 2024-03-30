@@ -147,22 +147,33 @@ def generate_image():
     current_user_id = get_jwt_identity()
     data = request.json
     text = data.get("text")
+    brand_name = data.get("brandName")
     if not text:
         return jsonify({"error": "Text description is required."}), 400
+
+    if not brand_name:
+        return jsonify({"error": "Brand name is required."}), 400
 
     images = generate_image_from_text(text)
 
     created_images_info = []
-    for image_data in images:
+    creation_date = datetime.utcnow().strftime("%d/%m/%Y")
+    for image_url in images:
         image_doc = {
             "user_id": ObjectId(current_user_id),
-            "image_data": image_data,
+            "image_url": image_url,
+            "brand_name": brand_name,
             "creation_date": datetime.utcnow()
         }
         image_id = db.images.insert_one(image_doc).inserted_id
-        created_images_info.append({"id": str(image_id), "image": image_data})
+        created_images_info.append(image_url)
 
-    return jsonify(created_images_info), 201
+        response_data = [{
+            'imgs': created_images_info,
+            'created': creation_date,
+        }]
+
+    return jsonify(response_data), 201
 
 
 @app.route('/api/image/get-history', methods=['GET'])
@@ -175,15 +186,25 @@ def get_image_history_for_user():
     if user_images.count() == 0:
         return jsonify({"message": "No images found for the user"}), 404
 
-    images_by_date = {}
+    images_by_brand_and_date = {}
     for img in user_images:
         date_key = img["creation_date"].strftime("%d/%m/%Y")
-        if date_key not in images_by_date:
-            images_by_date[date_key] = []
-        images_by_date[date_key].append(img["image_data"])
+        brand_name = img["brand_name"]
+        combined_key = f"{date_key} - {brand_name}"
 
-    data = [{"date": date, "imgs": images}
-            for date, images in images_by_date.items()]
+        if combined_key not in images_by_brand_and_date:
+            images_by_brand_and_date[combined_key] = {
+                "brandName": brand_name,
+                "date": date_key,
+                "imgs": []
+            }
+
+        images_by_brand_and_date[combined_key]["imgs"].append({
+            "id": str(img["_id"]),
+            "url": img["image_url"]
+        })
+
+    data = list(images_by_brand_and_date.values())
 
     return jsonify(data), 200
 
