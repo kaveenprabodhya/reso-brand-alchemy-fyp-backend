@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from flask_bcrypt import Bcrypt
@@ -6,7 +6,7 @@ from flask_cors import CORS
 from datetime import datetime
 from flask_socketio import SocketIO, emit
 from emotion_detector import analyze_emotion_frame_async, process_frame_for_motion
-from generate_image import generate_image_from_text
+from generate_image import generate_image_from_text, download_images
 from PIL import Image as PILImage
 from threading import Lock
 from flask import session
@@ -14,12 +14,15 @@ from flask_jwt_extended import JWTManager, create_access_token, verify_jwt_in_re
 from datetime import timedelta, datetime
 from collections import defaultdict
 from bson.objectid import ObjectId
-from pymongo import MongoClient
+from pymongo import MongoClient, DESCENDING
+from bson.binary import Binary
 import io
 import base64
 import cv2
 import numpy as np
 import re
+import uuid
+import os
 
 app = Flask(__name__)
 app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'
@@ -141,72 +144,107 @@ def delete_account():
     return jsonify({"message": "Account deleted successfully"}), 200
 
 
+def add_images_to_mongodb(img_paths, metadata, batch_id):
+    img_ids = []
+    for path in img_paths:
+        with open(path, 'rb') as file:
+            content = Binary(file.read())
+            metadata_copy = metadata.copy()
+            metadata_copy.update({
+                'image': content,
+                'batch_id': batch_id  # Include the batch ID in each document
+            })
+            img_id = images_collection.insert_one(metadata_copy).inserted_id
+            img_ids.append(img_id)
+    return img_ids
+
+
 @app.route('/api/image/generate-image', methods=['POST'])
 @jwt_required()
 def generate_image():
     current_user_id = get_jwt_identity()
     data = request.json
-    text = data.get("text")
     brand_name = data.get("brandName")
-    if not text:
-        return jsonify({"error": "Text description is required."}), 400
+    colors_captured = data.get("colors")
+
+    print(brand_name)
+    print(colors_captured)
 
     if not brand_name:
         return jsonify({"error": "Brand name is required."}), 400
 
-    images = generate_image_from_text(text)
+    if not colors_captured:
+        return jsonify({"error": "Captured colors are required."}), 400
 
-    created_images_info = []
-    creation_date = datetime.utcnow().strftime("%d/%m/%Y")
-    for image_url in images:
-        image_doc = {
-            "user_id": ObjectId(current_user_id),
-            "image_url": image_url,
-            "brand_name": brand_name,
-            "creation_date": datetime.utcnow()
-        }
-        image_id = db.images.insert_one(image_doc).inserted_id
-        created_images_info.append(image_url)
+    image_urls = generate_image_from_text(brand_name, colors_captured)
+    batch_id = str(uuid.uuid4())
+    img_paths = download_images(image_urls, batch_id)
 
-        response_data = [{
-            'imgs': created_images_info,
-            'created': creation_date,
-        }]
+    metadata = {
+        "user_id": ObjectId(current_user_id),
+        "brand_name": brand_name,
+        "creation_date": datetime.utcnow()
+    }
+    img_ids = add_images_to_mongodb(img_paths, metadata, batch_id)
+    base_url = request.host_url.rstrip('/')
+    local_urls = [f'{base_url}/image/{str(img_id)}' for img_id in img_ids]
 
-    return jsonify(response_data), 201
+    return jsonify({
+        'message': 'Images generated and saved successfully',
+        'local_urls': local_urls,
+    }), 201
+
+
+@app.route('/image/<image_id>')
+def get_image(image_id):
+    image_data = images_collection.find_one({"_id": ObjectId(image_id)})
+    if not image_data or 'image' not in image_data:
+        return jsonify({"error": "Image not found"}), 404
+    return Response(image_data['image'], mimetype='image/jpeg')
 
 
 @app.route('/api/image/get-history', methods=['GET'])
 @jwt_required()
 def get_image_history_for_user():
     current_user_id = get_jwt_identity()
-    user_images = db.images.find(
-        {"user_id": ObjectId(current_user_id)}).sort("creation_date", -1)
+    user_images_query = {"user_id": ObjectId(current_user_id)}
 
-    if user_images.count() == 0:
+    # Fetch images and sort by creation_date, brand_name, and batch_id in a meaningful order
+    user_images = images_collection.find(user_images_query).sort(
+        [("creation_date", DESCENDING), ("brand_name", 1), ("batch_id", 1)])
+
+    # Initialize a structure to hold organized image data
+    organized_images = []
+
+    base_url = request.host_url.rstrip('/')
+    for img in user_images:
+        # Construct the image URL
+        image_url = f'{base_url}/image/{str(img["_id"])}'
+
+        # Use batch_id as an identifier, if available, or a placeholder if not
+        batch_id = img.get("batch_id", "Unknown")
+
+        # Find an existing entry for the brand_name, created, and batch_id or create a new one
+        existing_entry = next((item for item in organized_images if item["brandName"] == img["brand_name"] and
+                               item["created"] == img["creation_date"].strftime("%d/%m/%Y") and
+                               item["id"] == batch_id), None)
+
+        if existing_entry:
+            # If found, append the new image URL to the imgs list of the existing entry
+            existing_entry["imgs"].append(image_url)
+        else:
+            # If not found, create a new entry for this combination of brand_name, creation_date, and batch_id
+            organized_images.append({
+                "id": batch_id,
+                "brandName": img["brand_name"],
+                "imgs": [image_url],
+                "created": img["creation_date"].strftime("%d/%m/%Y")
+            })
+
+    if not organized_images:
         return jsonify({"message": "No images found for the user"}), 404
 
-    images_by_brand_and_date = {}
-    for img in user_images:
-        date_key = img["creation_date"].strftime("%d/%m/%Y")
-        brand_name = img["brand_name"]
-        combined_key = f"{date_key} - {brand_name}"
-
-        if combined_key not in images_by_brand_and_date:
-            images_by_brand_and_date[combined_key] = {
-                "brandName": brand_name,
-                "date": date_key,
-                "imgs": []
-            }
-
-        images_by_brand_and_date[combined_key]["imgs"].append({
-            "id": str(img["_id"]),
-            "url": img["image_url"]
-        })
-
-    data = list(images_by_brand_and_date.values())
-
-    return jsonify(data), 200
+    return jsonify(organized_images), 200
 
 
 reference_frame = None
@@ -326,13 +364,13 @@ def process_emotion_results(results):
 
 def get_emotion_color(emotion):
     emotion_color_mapping = {
-        'happy': 'yellow',
-        'sad': 'blue',
-        'angry': 'red',
-        'disgusted': 'green',
-        'fearful': 'purple',
-        'neutral': 'gray',
-        'surprised': 'orange',
+        'happy': '#FFEA00',
+        'sad': '#0077B6',
+        'angry': '#D32F2F',
+        'disgusted': '#388E3C',
+        'fearful': '#9C27B0',
+        'neutral': '#9E9E9E',
+        'surprised': '#FF9800',
     }
     return emotion_color_mapping.get(emotion, 'black')
 
