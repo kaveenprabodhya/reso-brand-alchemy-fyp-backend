@@ -16,7 +16,7 @@ def generate_image_from_text(brand_name, colors_captured):
             prompt=description,
             size="512x512",
             quality="standard",
-            n=1,
+            n=5,
         )
         img_url_array = []
         for img_data in response.data:
