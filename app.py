@@ -144,6 +144,29 @@ def delete_account():
     return jsonify({"message": "Account deleted successfully"}), 200
 
 
+@app.route('/api/image/delete-batch/<batch_id>', methods=['DELETE'])
+@jwt_required()
+def delete_images_by_batch(batch_id):
+    # Verify if the current user is the owner of the batch
+    current_user_id = get_jwt_identity()
+    print(f"Current user ID: {current_user_id}, Batch ID: {batch_id}")
+    # Check if at least one image exists in the batch and belongs to the current user
+    image_data = images_collection.find_one(
+        {"batch_id": batch_id, "user_id": ObjectId(current_user_id)})
+    if not image_data:
+        return jsonify({"error": "No images found for this batch or unauthorized to delete these images"}), 404
+
+    # Delete all images associated with the batch ID and the current user ID
+    deletion_result = images_collection.delete_many(
+        {"batch_id": batch_id, "user_id": ObjectId(current_user_id)})
+
+    # Check if images were deleted
+    if deletion_result.deleted_count == 0:
+        return jsonify({"error": "No images were deleted, please check the batch ID and your permissions"}), 400
+
+    return jsonify({"message": f"Successfully deleted {deletion_result.deleted_count} images from the batch"}), 200
+
+
 def add_images_to_mongodb(img_paths, metadata, batch_id):
     img_ids = []
     for path in img_paths:
